@@ -1,0 +1,23 @@
+{
+  "experiment_name": "exp02_rfdetr_small_e50_bs2",
+  "model_variant": "RFDETRSmall",
+  "timestamp": "2026-06-15 06:58:40",
+  "hyperparameters": {
+    "epochs": 50,
+    "batch_size": 2,
+    "grad_accum_steps": 8,
+    "effective_batch_size": 16,
+    "learning_rate": 0.0001,
+    "device": "cuda"
+  },
+  "dataset": {
+    "location": "c:\\Users\\User\\projectTA\\aku-nak-jugak-7",
+    "train_images": 298,
+    "valid_images": 29,
+    "test_images": 15
+  },
+  "training_duration_seconds": 2086.7,
+  "training_duration_minutes": 34.8,
+  "output_dir": "./output/exp02_rfdetr_small_e50_bs2",
+  "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU"
+}
