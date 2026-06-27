@@ -72,31 +72,50 @@ SiRapi secara literal punya **satu model YOLOv8 pre-trained** yang hanya mendete
 
 #### Apa yang Anda Tawarkan
 
+**Arsitektur pipeline (Final — Hybrid Sejati berdasarkan eksperimen Opsi B v2):**
+
 ```
-Frame → Multi-Object Detection Model (Custom-trained: topi, dasi, sabuk, sepatu, wajah)
-        [Model spesifik ditentukan dari hasil SLR & eksperimen]
-                    ↓
-        Face Recognition Model (Custom-trained)
-        [Model spesifik ditentukan dari hasil SLR & eksperimen]
-            → Match ke database siswa
-                    ↓
-        Spatial Association (Centroid)
-            → Link setiap atribut ke individu
-                    ↓
-        Output: "Ahmad Rizki → dasi: ✓, topi: ✗, sabuk: ✓, sepatu: ✓"
+Frame
+  ├────────────────────────────────────────────────────────┐
+  ↓                                                        ↓
+RF-DETR (Custom-trained)                                InsightFace (Full Frame)
+5 kelas: topi, dasi, sabuk,                             SCRFD detect + 5-point alignment
+         sepatu, WAJAH                                  → ArcFace embedding
+  ↓                                                        ↓
+BBox atribut                  BBox wajah (anchor)       Identitas + BBox wajah (SCRFD)
+(topi, dasi, sabuk, sepatu)           │                    │
+      │                               └─────────┬──────────┘
+      │                                         ↓
+      │                               Spatial Association 
+      │                     Match wajah RF-DETR ↔ wajah InsightFace
+      │                     (via IoU atau centroid distance)
+      │                                         ↓
+      └─────────────────────────────────────────┴── link identitas ke atribut terdekat
+                                                    ↓
+                                          Rule Engine Verifikasi
+                                                    ↓
+               Output: "Ahmad Rizki → dasi: ✓, topi: ✗, sabuk: ✓, sepatu: ✓"
 ```
 
-> **Catatan:** Pemilihan model detection dan face recognition **belum final** — akan ditentukan berdasarkan hasil Systematic Literature Review (SLR) dan eksperimen komparatif. Yang ditekankan di sini adalah **arsitektur pipeline terintegrasi**, bukan model spesifik. Ini justru menjadi kekuatan: model bisa dipilih yang paling presisi untuk domain seragam sekolah, tidak terkunci pada satu arsitektur tertentu seperti SiRapi yang hardcoded ke YOLOv8n pre-trained.
+**Dua engine yang berjalan paralel pada frame yang sama:**
+1. **RF-DETR (Atribut + Anchor):** Bertugas mendeteksi atribut seragam (topi, dasi, sabuk, sepatu) dan mendeteksi wajah HANYA sebagai anchor/titik pusat spasial.
+2. **InsightFace (Recognition):** Bertugas menjalankan pipeline face recognition end-to-end secara independen (deteksi SCRFD → alignment → ArcFace embedding → matching). InsightFace memproses frame utuh, bukan crop dari RF-DETR.
+
+> **Catatan model detection — RF-DETR:** Model dilatih dengan 5 kelas: topi, dasi, sabuk, sepatu, dan **wajah**. Wajah dideteksi oleh RF-DETR bukan sebagai input untuk face recognition, melainkan murni sebagai **anchor spasial** untuk menghubungkan atribut di sekitarnya ke wajah/orang yang tepat.
+
+> **Catatan face recognition — InsightFace (Opsi B v2):** Keputusan final berdasarkan eksperimen komparatif. ArcFace sangat bergantung pada orientasi wajah yang ternormalisasi (5-point landmark alignment dari SCRFD). Karena itu, InsightFace harus memproses frame secara utuh, bukan memproses crop wajah dari RF-DETR yang rentan memotong area di sekitar wajah dan menggagalkan proses ekstraksi landmark.
+
+> **Spatial Association (Penggabungan):** Pipeline menghubungkan (link) hasil identitas dari InsightFace ke atribut dari RF-DETR dengan cara mencocokkan bounding box wajah dari kedua detektor tersebut (misal via IoU tertinggi). Setelah wajah ter-match, identitas tersebut dihubungkan ke atribut-atribut terdekat di sekitarnya.
 
 #### Kekuatan Pembanding
 
 | Aspek | SiRapi | Sistem Anda |
 |-------|--------|-------------|
 | Person detection | ✓ (COCO pre-trained) | ✓ (Custom-trained, model dari hasil SLR) |
-| Attribute detection | ✗ (TODO) | ✓ (Custom classes) |
-| Face recognition | ✗ (tidak ada) | ✓ (Model dari hasil SLR & eksperimen) |
+| Attribute detection | ✗ (TODO) | ✓ (5 custom classes: topi, dasi, sabuk, sepatu, wajah) |
+| Face recognition | ✗ (tidak ada) | ✓ (ArcFace via InsightFace, enrollment-based) |
 | Per-student output | ✗ | ✓ |
-| Single pipeline | N/A | ✓ (integrated) |
+| Single pipeline | N/A | ✓ (RF-DETR → ArcFace → Spatial Assoc → Rule Engine, in-process) |
 | Model selection rigor | Asal pakai pre-trained | Berbasis SLR + eksperimen komparatif |
 
 #### Verdict: **Keunggulan Absolut**
@@ -289,13 +308,63 @@ Sangat sedikit yang secara eksplisit menyelesaikan masalah **multi-person attrib
 - **Pembeda utama** yang sulit ditiru tanpa effort signifikan
 - **Problem statement** yang kuat: "Bagaimana mengasosiasikan atribut seragam yang terdeteksi ke individu yang tepat dalam skenario multi-person?"
 
-#### Potensi Peningkatan
+#### Taksonomi 4 Pendekatan Algoritmik Asosiasi Spasial
 
-Untuk memperkuat novelty ini secara akademis:
-- **Bandingkan** beberapa metode assignment: Euclidean distance, IoU overlap, Hungarian algorithm
-- **Ukur** akurasi assignment di berbagai skenario: 1 orang, 2 orang berdekatan, 5+ orang antrian
-- **Definisikan threshold** jarak maksimum untuk assignment (jika terlalu jauh, atribut tidak di-assign ke siapapun)
-- **Pertimbangkan** pose-based ROI sebagai alternative/complement: jika face di (200,150), maka dasi seharusnya di sekitar (200, 250-300) — gunakan anatomical prior
+Pada tataran algoritmik, terdapat empat pendekatan dominan yang perlu dipahami agar pemilihan dapat dijustifikasi secara akademis:
+
+| # | Pendekatan | Mekanisme | Kompleksitas | Kapan Digunakan |
+|---|-----------|-----------|--------------|-----------------|
+| 1 | **Euclidean Centroid Distance** | Mengukur kedekatan antar-objek melalui titik pusat geometrisnya (Zhou et al., 2020) | O(n·m) | Objek tidak saling overlap, distribusi spasial relatif terpisah |
+| 2 | **Greedy Nearest-Neighbor** | Memasangkan setiap deteksi dengan tetangga terdekatnya secara iteratif (Papais et al., 2024) | O(n·m) | Real-time dengan jumlah objek terbatas — sangat ringan |
+| 3 | **Hungarian Algorithm** (linear assignment) | Menghasilkan pemasangan optimal secara global atas matriks biaya; tulang punggung SORT dan DeepSORT (Bewley et al., 2016; Wojke et al., 2017) | O(n³) | Butuh assignment optimal global, jumlah objek moderat |
+| 4 | **IoU-based Matching** | Memanfaatkan tumpang-tindih spasial alih-alih jarak titik; dipakai ByteTrack dan turunannya (Zhang et al., 2022; Du et al., 2023) | O(n·m) | Objek saling bersarang atau memiliki area overlap signifikan |
+
+> **Pilihan untuk sistem ini:** **Euclidean Centroid + Hungarian Algorithm** paling sesuai untuk domain verifikasi seragam. Pendekatan berbasis IoU kurang cocok karena bounding box wajah dan atribut seragam (dasi di leher, topi di kepala, sepatu di kaki) **secara anatomis tidak saling tumpang-tindih** — sehingga IoU mendekati nol dan tidak informatif sebagai biaya assignment.
+
+#### Justifikasi Pemilihan Centroid untuk Domain Seragam Sekolah
+
+Ini adalah argumen akademis kunci untuk menjawab "mengapa centroid, bukan IoU?":
+
+**Karakteristik spasial unik domain seragam:**
+- Topi → **atas wajah** (y_topi < y_face)
+- Wajah → **area kepala** (referensi anchor)
+- Dasi → **leher/dada**, di bawah wajah (y_dasi > y_face)
+- Sabuk → **pinggang**, jauh di bawah (y_sabuk >> y_face)
+- Sepatu → **kaki**, paling bawah (y_sepatu >>> y_face)
+
+Karena setiap atribut memiliki **lokasi anatomis yang relatif tetap dan tidak overlap** dengan bounding box wajah, jarak Euclidean antara centroid wajah dan centroid atribut adalah metrik yang **informatif dan diskriminatif**. Dua atribut dari dua siswa yang berdekatan akan memiliki jarak centroid yang berbeda secara signifikan ke wajah masing-masing.
+
+Ini berbeda dari skenario tracking kendaraan (ByteTrack) di mana bounding box bisa saling overlap dan IoU menjadi metrik yang lebih relevan.
+
+**Anatomical Prior sebagai hard constraint tambahan:**
+
+Untuk meningkatkan robustness, anatomical prior bisa ditambahkan sebagai pre-filter sebelum jarak dihitung:
+- Jika `face_centroid = (x_f, y_f)`, dasi seharusnya ada di sekitar `(x_f, y_f + Δ_dasi)` — offset vertikal yang dapat dikalibrasi per setup kamera
+- Atribut yang centroid-nya di luar rentang anatomis yang masuk akal di-filter sebelum masuk assignment
+- Ini mengurangi false assignment pada skenario crowded scene
+
+#### Potensi Peningkatan & Mitigasi Mis-Association
+
+**1. Eksperimen komparatif metode assignment:**
+- Bandingkan: Euclidean centroid (greedy NN) vs Euclidean centroid (Hungarian) vs biaya komposit (centroid + IoU)
+- Ukur akurasi assignment di skenario: 1 orang, 2 orang berdekatan, 3 orang antrian (sesuai batasan masalah)
+- Metrik evaluasi: assignment precision (% atribut yang di-assign ke individu yang benar)
+
+**2. Mitigasi mis-association (strategi berlapis):**
+- **Gating radius (distance threshold):** Jika jarak centroid atribut ke wajah terdekat melebihi `d_max`, atribut tidak di-assign ke siapapun (dianggap noise/oklusi) — mencegah false assignment jarak jauh
+- **Kendala posisi relatif antar-kelas:** Constraint anatomis sebagai hard filter — dasi harus di bawah wajah (`y_dasi > y_face`), topi harus di atas wajah (`y_topi < y_face`), dst.
+- **Biaya komposit centroid + IoU:** Untuk skenario crowded, kombinasikan sebagai weighted cost matrix: `cost = α × dist_euclidean + (1-α) × (1 - IoU)` (Wang et al., 2022; Du et al., 2023)
+
+**Keputusan algoritma untuk TA ini:**
+
+> **Pilihan utama: Greedy Nearest-Neighbor + distance threshold.** Dipilih karena: (1) kompleksitas komputasi rendah O(n·m) — cocok untuk real-time, (2) sederhana dan transparan — mudah dijelaskan, di-debug, dan divalidasi, (3) sufficient untuk batasan skenario ≤3 siswa per frame di mana konflik assignment sangat jarang terjadi. Distance threshold (gating) ditambahkan sebagai mitigasi false assignment jarak jauh.
+>
+> **Hungarian Algorithm O(n³)** — menghasilkan assignment optimal secara global — tetap disebutkan sebagai potensi enhancement untuk skenario yang lebih padat (>3 siswa). Jika eksperimen komparatif menunjukkan Hungarian memberikan hasil yang signifikan lebih baik pada data nyata, algoritma ini dapat menggantikan greedy NN. Keputusan final berdasarkan hasil eksperimen.
+
+**3. Evaluasi pada edge case:**
+- Dua siswa berdekatan (< 50px antar centroid wajah)
+- Atribut terpotong di tepi frame (centroid bisa offset dari posisi sebenarnya)
+- Oklusi parsial (satu siswa tertutup sebagian oleh siswa lain)
 
 ---
 
@@ -397,11 +466,13 @@ SiRapi punya script training tapi dataset-nya untuk **PPE detection** (helm, ves
 
 #### Apa yang Anda Tawarkan
 
-- Dataset dikumpulkan langsung dari lingkungan sekolah mitra
-- Mencakup kondisi operasional nyata: antrian pagi, variasi pencahayaan, pose berbeda
-- Fokus awal: seragam OSIS (putih-abu-abu) — scope terkontrol
-- Rencana ekspansi: 2-3 jenis seragam (batik, pramuka) — bisa jadi future work
-- Label classes: wajah siswa, topi, dasi, sabuk, sepatu (domain-specific)
+- Dataset dikumpulkan langsung dari lingkungan sekolah mitra (SMK, lab indoor)
+- **Posisi kamera:** Indoor, ditempatkan di sekitar pintu masuk/keluar lab, mengarah ke pintu — kondisi pencahayaan indoor terkontrol, jarak siswa ke kamera relatif konsisten
+- Mencakup kondisi operasional nyata: antrian masuk lab, variasi pencahayaan indoor, pose berbeda (dari depan/samping)
+- Fokus awal: seragam OSIS, **Senin–Selasa** (hari lain masih perlu konfirmasi dengan sekolah mitra) — scope terkontrol
+- Rencana ekspansi: hari lain + 2-3 jenis seragam (batik, pramuka) — future work
+- **Label classes (target deteksi):** wajah siswa, **topi, dasi, sabuk, sepatu** — 4 atribut kelengkapan seragam yang dapat divisualisasikan secara eksplisit oleh kamera
+- *Catatan scope:* Kemeja putih dan celana/rok abu **tidak dideteksi** (sulit dibedakan dari pakaian lain secara visual dari kamera pintu + bukan prioritas differentiator) — keputusan ini documented sebagai batasan penelitian
 
 #### Kekuatan Pembanding
 
@@ -471,9 +542,10 @@ SiRapi punya:
 
 #### Apa yang Anda Tawarkan
 
-Deployment pragmatis:
-- **CCTV:** Dari sekolah (jika support RTSP) atau disediakan sendiri
-- **Server:** Server sekolah (jika diizinkan) atau laptop peneliti
+Deployment pragmatis (keputusan final untuk TA):
+- **CCTV:** IP Camera RTSP yang **disediakan sendiri** (dual-purpose: kebutuhan rumah + TA) — terhubung ke laptop peneliti/server sekolah jika diizinkan  via **LAN lokal**, tanpa internet untuk video streaming (`rtsp://[IP_ADDRESS]/stream`)
+- **Server/Edge:** Laptop peneliti — menjalankan AI pipeline + FastAPI backend (in-process, zero overhead)
+- **Dashboard:** React SPA (static build) di-host di **cloud/CDN** (Vercel/Netlify, gratis) — diakses via browser mana saja; FastAPI di edge di-expose via **Cloudflare Tunnel**
 - **Tidak over-promise:** Tidak claim Jetson Orin jika belum punya
 
 #### Kekuatan Pembanding
@@ -489,12 +561,12 @@ Ironisnya, pendekatan Anda **lebih jujur dan realistis** dibanding SiRapi:
 
 #### Insight
 
-Untuk konteks TA prototipe:
-- **Jangan over-engineer deployment.** Laptop + webcam/CCTV untuk demo sudah cukup
+Untuk konteks TA prototipe (keputusan deployment yang sudah dikonfirmasi):
+- **RTSP via LAN — tidak butuh internet:** CCTV dan laptop peneliti/server sekolah jika diijinkan sekolah cukup di-connect ke router/switch yang sama; video stream pure lokal, tidak ada data keluar ke internet (`cv2.VideoCapture("rtsp://[IP_ADDRESS]/stream")`)
 - Jika punya GPU di laptop (bahkan GTX 1650), YOLO inference sudah sangat cepat
 - **Nilai plus jika bisa:** Export model ke ONNX Runtime untuk inference lebih cepat di CPU
-- Jika nanti bisa demo di sekolah mitra dengan CCTV nyata, itu sudah jauh melebihi SiRapi yang masih di level Docker localhost
-
+- **Dashboard Opsi B (keputusan final):** React SPA di-host di Vercel/Netlify (gratis, static files)+ FastAPI di edge di-expose via **Cloudflare Tunnel** (gratis, tanpa port forwarding, tanpa buka port router) — guru/admin akses dashboard dari device mana saja
+- Demo dengan IP Camera RTSP nyata yang disediakan sendiri sudah jauh melebihi SiRapi yang masih di level Docker localhost + webcam biasa
 ---
 
 #### Ekstensi 5.1: Privacy-Preserving Data Flow (Privacy by Design)
@@ -503,26 +575,29 @@ Edge deployment secara inheren memberikan keuntungan privasi, tapi sistem ini me
 
 **Commitment data flow:**
 
-| Data | Lokasi | Keluar dari edge? |
-|------|--------|-------------------|
-| Raw video stream | Edge device | ❌ Tidak pernah |
-| Foto wajah siswa (enrollment & evidence) | Edge device storage | ❌ Tidak pernah |
-| Face embeddings | Edge device database | ❌ Tidak pernah |
-| **Metadata deteksi** (nama, status, timestamp, atribut) | Edge → n8n → chat | ✅ Hanya text metadata |
-| Aggregated statistics | Edge → dashboard | ✅ Text numeric |
+| Data | Lokasi | Keluar dari edge? | Catatan |
+|------|--------|-------------------|----------|
+| Raw video stream | Edge device (LAN only) | ❌ Tidak pernah | Endpoint `/video_feed/*` dibatasi IP lokal — tidak bisa diakses via Cloudflare Tunnel |
+| Processed video (overlay bounding box) | Edge → Browser (LAN only) | ❌ Hanya dalam LAN | Streaming real-time di LAN, tidak disimpan di luar edge |
+| Foto wajah siswa (enrollment & evidence) | Edge device storage | ❌ Tidak pernah | Citra mentah disimpan lokal untuk enrollment; tidak pernah dikirim ke luar edge |
+| Face embeddings (vektor ArcFace 512-dim) | Edge device database | ❌ Tidak pernah | Vektor numerik hasil InsightFace — digunakan hanya untuk matching lokal di edge; bukan citra, tidak pernah disinkronisasi ke cloud |
+| **Metadata deteksi** (nama, status, timestamp, atribut terdeteksi) | Edge → n8n → cloud dashboard | ✅ Hanya text metadata | Tidak mengandung gambar, video, maupun embedding — murni data teks hasil klasifikasi |
+| Aggregated statistics | Edge → cloud dashboard | ✅ Text numeric | Rekapitulasi angka (jumlah pelanggaran, dsb.) — tidak mengandung data personal biometrik |
+
+> **Catatan penting:** Meskipun pipeline menghasilkan **face embedding ArcFace** (vektor 512-dimensi), embedding ini **bukan citra wajah** dan **tidak pernah meninggalkan edge device**. Embedding digunakan murni untuk pencocokan identitas lokal (inference matching) — hasilnya hanya berupa `nama_siswa` (text) yang kemudian dikirim sebagai bagian dari metadata deteksi. Ini adalah contoh **data minimization dalam alur keluar**: yang keluar hanya identitas yang sudah terverifikasi (nama), bukan representasi biometrik mentahnya.
 
 **Perbedaan fundamental vs SiRapi:**
 
 SiRapi menyimpan evidence image plain di filesystem `/evidence/` (G-SC3) dan laporan PDF mengandung foto siswa tanpa anonymization (G-SC6). Jika server diakses, semua foto bocor.
 
 Sistem Anda:
-- **Foto siswa TIDAK PERNAH keluar dari edge device**
+- **Foto siswa dan face embedding TIDAK PERNAH keluar dari edge device**
 - Notifikasi WA/TG hanya berisi text: *"Ahmad Rizki (10-A) tidak memakai dasi pukul 07:15"* — tidak ada foto terlampir
 - Laporan PDF hanya mengandung data text + grafik aggregate (optional: foto dengan wajah di-blur jika diminta)
-- n8n + LLM memproses hanya metadata, bukan raw images
+- n8n + LLM memproses hanya metadata text, bukan raw images maupun face embedding
 
 **Framing akademis:**
-Ini adalah **privacy by design, bukan privacy by policy.** Bukan sekadar menambahkan kebijakan "kami janji tidak share foto" — secara arsitektural foto memang tidak bisa share karena tidak pernah keluar dari edge. Pendekatan ini aligned dengan prinsip **data minimization** di UU PDP Pasal 16.
+Ini adalah **privacy by design, bukan privacy by policy.** Bukan sekadar menambahkan kebijakan "kami janji tidak share foto" — secara arsitektural foto dan embedding memang tidak bisa share karena tidak pernah keluar dari edge. Yang keluar ke cloud hanya **text hasil klasifikasi**: nama siswa (dari matching lokal), status kelengkapan, dan timestamp. Pendekatan ini aligned dengan prinsip **data minimization** di UU PDP Pasal 16.
 
 ---
 
@@ -717,29 +792,30 @@ LLM bot bisa generate pesan positif yang personal:
 - SSR (Server-Side Rendering) Next.js butuh Node.js server berjalan = lebih berat di edge
 - Deployment complexity tinggi (3 Dockerfile, docker-compose orchestration)
 
-### Sistem Anda: 2 Service (Recommended)
+### Sistem Anda: 2 Service — Opsi B Split Deployment (Keputusan Final TA)
 
 ```
-┌──────────────────┐         ┌──────────────────────────┐
-│ React SPA (Vite) │◄──REST──►│ FastAPI (Unified Backend) │
-│                  │         │                          │
-│ Static files     │         │ ├── /api/auth/*          │
-│ (bisa di-host    │         │ ├── /api/detections/*    │
-│  dari mana saja) │         │ ├── /api/students/*      │
-│                  │   WS    │ ├── /api/reports/*       │
-│ TailwindCSS      │◄───────►│ ├── /ws (WebSocket)     │
-│ Recharts         │         │ ├── /video_feed/*        │
-│ TypeScript       │         │ │                        │
-└──────────────────┘         │ ├── AI Pipeline:         │
-                             │ │   ├── Detection (SLR)  │
-                             │ │   ├── Face Recog (SLR) │
-                             │ │   └── Spatial Assoc.   │
-                             │ │                        │
-                             │ ├── SQLite / PostgreSQL  │
-                             │ ├── JWT Auth             │
-                             │ └── n8n Webhook trigger  │
-                             └──────────────────────────┘
-                                   1 Python process
+        ☁️ CLOUD                               🏫 EDGE (LAN Sekolah)
+┌──────────────────────────┐        ┌──────────────────────────────────┐
+│  React SPA (Vite)        │        │  FastAPI (Unified Backend)        │
+│  [Vercel / Netlify]      │◄─HTTPS─►│  [Laptop Peneliti]                │
+│                          │  REST  │                                  │
+│  Static files            │◄─WSS──►│  ├── /api/auth/*                 │
+│  (HTML / JS / CSS)       │        │  ├── /api/detections/*            │
+│  TailwindCSS             │        │  ├── /api/students/*              │
+│  Recharts                │        │  ├── /api/reports/*               │
+│  TypeScript              │        │  ├── /ws (WebSocket)              │
+└──────────────────────────┘        │  ├── /video_feed/*                │
+  Akses dari browser mana saja      │  │                                │
+  (guru, admin, wali kelas)         │  ├── AI Pipeline:                 │
+                                    │  │   ├── Detection (SLR)          │
+  📡 via Cloudflare Tunnel          │  │   ├── Face Recog (SLR)         │
+  (gratis, tanpa port forwarding)   │  │   └── Spatial Assoc.           │
+                                    │  ├── PostgreSQL                   │
+  📷 IP Camera (LAN, RTSP)         │  ├── JWT Auth                     │
+  rtsp://192.168.x.x:554 ──────────►│  └── n8n Webhook trigger         │
+  (pure LAN, tanpa internet)        └──────────────────────────────────┘
+                                           1 Python process
 ```
 
 ### Perbandingan Arsitektur
@@ -753,7 +829,10 @@ LLM bot bisa generate pesan positif yang personal:
 | **AI ↔ Backend latency** | HTTP call antar service | In-process (zero network overhead) |
 | **Memory footprint** | ~2-3 GB (3 service) | ~1-1.5 GB (1 service + static) |
 | **Development speed** | Perlu kuasai 3 bahasa | Cukup Python + TypeScript |
-| **Suitability untuk TA** | Over-engineered | Right-sized |
+| **Frontend hosting** | Node.js server (butuh VPS/server) | Vercel/Netlify gratis (static CDN) |
+| **Backend accessibility** | LAN lokal saja | Cloudflare Tunnel → akses dari mana saja |
+| **Video input** | Webcam/RTSP (tidak terdokumentasi) | CCTV IP Camera RTSP via LAN (disediakan sendiri) |
+| **Suitability untuk TA** | Over-engineered | Right-sized + pragmatis |
 
 ### Rekomendasi Frontend: React + TypeScript + Vite
 
@@ -1035,16 +1114,16 @@ Dalam bagian "Tinjauan Pustaka" atau "Penelitian Terkait":
 
 Berikut adalah fitur-fitur **yang layak diadopsi** dari SiRapi (best practice) beserta **inovasi tambahan** yang menjadi pembeda:
 
-#### Halaman Dashboard yang Layak Diadopsi dari SiRapi
+#### Halaman Dashboard yang Layak Diadopsi dari Kompetitor: SiRapi
 
 | Halaman SiRapi | Relevansi | Adopsi / Adaptasi untuk Sistem Anda |
 |---------------|-----------|-------------------------------------|
-| **Dashboard KPI** (stats, trend, violation breakdown) | Tinggi | **Adopsi** — tambah: per-student stats, attendance rate, LLM bot widget |
-| **CCTV Monitoring Grid** (live feed + status) | Tinggi | **Adopsi** — feed dari pipeline AI yang sudah integrated (bukan raw stream) |
-| **Analytics/Reports** (trend chart, export PDF/Excel) | Tinggi | **Adopsi** — tambah: laporan absensi per siswa, format compatible Dapodik |
+| **Dashboard KPI** (stats, trend, violation breakdown) | Tinggi | ✅ **Adopsi** — tambah: per-student stats, attendance rate, LLM bot widget |
+| **CCTV Monitoring Grid** (live feed + status) | Tinggi | ✅ **Adopsi — Local-Only:** processed video feed (bounding box + label nama + status atribut) hanya dapat diakses dari LAN sekolah; remote dashboard hanya tampilkan metadata. Endpoint `/video_feed/*` dibatasi IP lokal via middleware |
+| **Analytics/Reports** (trend chart, export PDF/Excel) | Tinggi | ✅ **Adopsi** — tambah: laporan absensi per siswa, format compatible Dapodik |
 | **Alert Management** (severity, acknowledge workflow) | Sedang | **Simplifikasi** — integrasi dengan n8n, alert langsung ke WA/TG |
-| **Student Directory** (violation history per siswa) | Tinggi | **Adopsi + Enhance** — gabung dengan attendance record + face enrollment data |
-| **Settings/Config** (camera, notification, rules) | Tinggi | **Adopsi** — tambah: konfigurasi jadwal seragam per hari, dispensasi |
+| **Student Directory** (violation history per siswa) | Tinggi | ✅ **Adopsi + Enhance** — gabung dengan attendance record + face enrollment data |
+| **Settings/Config** (camera, notification, rules) | Sedang | **Adopsi — Simplified:** konfigurasi kamera (RTSP URL), notifikasi (token/recipient), threshold confidence. Konfigurasi jadwal multi-seragam & dispensasi → **Future Work** (scope TA: OSIS Senin–Selasa, aturan hardcoded) |
 | Security Audit (login activity, session mgmt) | Rendah (untuk prototipe) | **Skip dulu** — implementasi di fase production maturity |
 | Annotation Backlog, Triage Rules, Custom Dashboard | Rendah | **Skip** — enterprise features yang tidak relevan untuk konteks sekolah |
 | Heatmap/Map (Leaflet) | Rendah-Sedang | **Optional** — implementasi jika ada multi-zone di sekolah |
@@ -1057,7 +1136,7 @@ Berikut adalah fitur-fitur **yang layak diadopsi** dari SiRapi (best practice) b
 | **Per-Student Status View** | Halaman detail per siswa: foto, riwayat absensi, riwayat pelanggaran, trend, streak, badge | SiRapi tidak punya karena tidak ada face recognition |
 | **Attendance Log** | Log absensi real-time (siapa masuk jam berapa, seragam lengkap/tidak) | SiRapi tidak punya model Attendance sama sekali |
 | **Face Enrollment Page** | Interface untuk daftarkan wajah siswa baru (upload foto / capture dari webcam) + Dapodik bulk import | SiRapi tidak memiliki konsep ini |
-| **Schedule-Aware Config** | Konfigurasi aturan seragam per hari langsung dari dashboard | SiRapi rules engine hardcoded untuk HSE |
+| **Schedule-Aware Config** | Konfigurasi aturan seragam per hari langsung dari dashboard | SiRapi rules engine hardcoded untuk HSE — **untuk TA ini adalah Future Work**; scope dibatasi OSIS Senin–Selasa dengan rule hardcoded |
 | **Live Detection Overlay** | Video feed + bounding box real-time + label nama siswa + status atribut | SiRapi hanya menampilkan raw YOLO bounding box tanpa identitas |
 | **Review Queue (Connected to Retraining)** | UI untuk review low-confidence detection → label → trigger retraining | SiRapi punya backlog tapi tidak connected ke retraining |
 | **Gamification Dashboard** | Personal streak counter, badge collection, class leaderboard, compliance heatmap | SiRapi hanya punya leaderboard statis tanpa reward mechanism |
@@ -1086,22 +1165,24 @@ Karena model detection dan face recognition **belum ditentukan** dan akan dipili
 | Robustness | Accuracy drop di variasi kondisi | <5% degradation | Pencahayaan, angle, masker |
 | Database scalability | Matching speed di N siswa | <10ms untuk N<1000 | Cukup untuk 1 sekolah |
 
-#### Kandidat Model (untuk diuji, bukan rekomendasi final)
+#### Status Model (Hasil SLR + Eksperimen Awal)
 
-**Detection — kandidat dari literatur:**
-- Arsitektur YOLO family (v5/v7/v8/v9/v10/v11) — state-of-the-art real-time detection
-- EfficientDet — balance akurasi-speed
-- RT-DETR — transformer-based real-time
-- *Model final dipilih berdasarkan hasil eksperimen pada dataset seragam sekolah*
+**Detection — RF-DETR (Keputusan Sementara, Masih Eksperimen):**
+- **RF-DETR Medium** — transformer-based detector dari Roboflow, dilatih + dievaluasi langsung di platform Roboflow(tapi sepertinya hanya awal saja, selanjutnya pretrain sendiri )
+- Hasil eksperimen awal: beberapa metrik **di atas 95%** pada dataset seragam sekolah
+- Ukuran model estimasi **< 50 MB** — memenuhi kriteria edge deployment
+- **Masih akan dieksplorasi:** RF-DETR Small — jika akurasi masih memadai, ukuran lebih kecil = lebih ringan di edge
+- Platform anotasi + training: **Roboflow** (anotasi, augmentasi, tapi selanjutnya pretrain sendiri )
+- *Keputusan final (Medium vs Small) ditentukan setelah eksperimen perbandingan selesai*
 
-**Face Recognition — kandidat dari literatur:**
-- ArcFace (InsightFace) — state-of-the-art face verification
-- FaceNet — Google's triplet loss approach
-- CosFace / SphereFace — angular margin variants
-- DeepFace library — unified interface untuk perbandingan
-- *Model final dipilih berdasarkan hasil eksperimen pada dataset wajah siswa*
+**Face Recognition — ArcFace (Rencana Utama, Sedang Proses):**
+- **ArcFace** (via InsightFace library) — state-of-the-art additive angular margin loss, TAR@FAR=1e-4 tinggi
+- Dipilih berdasarkan dominasi di SLR: konsisten unggul di LFW, IJB-C, MegaFace benchmarks
+- Implementasi: sedang dalam proses eksplorasi dan integrasi
+- Kandidat fallback: FaceNet (jika ArcFace terlalu berat di edge), DeepFace (unified wrapper)
+- *Model final dikonfirmasi setelah eksperimen pada dataset wajah siswa sekolah mitra*
 
-> **Kekuatan pendekatan ini vs SiRapi:** SiRapi langsung memakai YOLOv8n tanpa justifikasi akademis (bahkan model-nya pre-trained COCO, bukan custom). Sistem Anda memilih model berdasarkan **evidence dari SLR dan eksperimen** — ini adalah standar rigor penelitian yang diharapkan di TA.
+> **Kekuatan pendekatan ini vs SiRapi:** SiRapi langsung memakai YOLOv8n tanpa justifikasi akademis (bahkan model-nya pre-trained COCO, bukan custom). Sistem Anda memilih model berdasarkan **evidence dari SLR dan eksperimen nyata** (RF-DETR sudah mencapai >95% pada dataset domain) — ini adalah standar rigor penelitian yang diharapkan di TA.
 
 ### 7.5 Arsitektur Teknis yang Direkomendasikan
 
